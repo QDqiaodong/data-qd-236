@@ -19,6 +19,7 @@ single-process, relies on trusted local directories and performs no locking
 against other processes; it makes no power-loss guarantees.
 """
 
+from collections import namedtuple
 from contextlib import closing
 import hashlib
 import os
@@ -30,6 +31,31 @@ from time import monotonic
 
 class InvalidSnapshot(ValueError):
     """The database failed validation and was not published."""
+
+
+class RouteRepairError(ValueError):
+    """A business rule rejected a route-repair preview or application.
+
+    ``reason`` is one of ``missing_route`` (a selected id is absent from one
+    of the two databases), ``alias_conflict`` (a planned alias is held by a
+    route outside the repair scope) or ``stale_plan`` (the live database no
+    longer matches what the plan previewed, or the plan is being applied to a
+    different live file).
+    """
+
+    def __init__(self, reason, detail=""):
+        self.reason = reason
+        message = reason if not detail else "%s: %s" % (reason, detail)
+        super().__init__(message)
+
+
+# Immutable, in-process route repair plan.  ``changes`` is a tuple of
+# (route_id, current_alias, current_destination, planned_alias,
+# planned_destination) sorted by route_id; ``alias_occupancy`` records the
+# owner of every planned alias at preview time, with ``None`` meaning free.
+RouteRepairPlan = namedtuple(
+    "RouteRepairPlan", ("live_path", "changes", "alias_occupancy")
+)
 
 
 class SpaceError(RuntimeError):
@@ -486,3 +512,236 @@ class VersionedArchive:
                 os.unlink(staging)
             except FileNotFoundError:
                 pass
+
+
+# --------------------------------------------------------------------------
+# Local route repair driven by an independent backup file
+# --------------------------------------------------------------------------
+
+
+_REPAIR_MIN_COUNT = 1
+_REPAIR_MAX_COUNT = 100
+_REPAIR_TEMP_PREFIX = ".route-repair-temp-"
+
+
+def _validate_route_ids(route_ids):
+    """Normalize the caller's id list or raise plain ``ValueError``."""
+    try:
+        ids = list(route_ids)
+    except TypeError:
+        raise ValueError("route_ids must be an iterable of integers")
+    if not (_REPAIR_MIN_COUNT <= len(ids) <= _REPAIR_MAX_COUNT):
+        raise ValueError("route_ids must contain between 1 and 100 distinct ids")
+    distinct = set()
+    for value in ids:
+        # ``bool`` is an ``int`` subclass but never a legal primary key here.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("route ids must be integers")
+        if value in distinct:
+            raise ValueError("duplicate route id: %d" % value)
+        distinct.add(value)
+    return sorted(distinct)
+
+
+def _placeholders(count):
+    return ",".join("?" * count)
+
+
+def plan_route_repair(backup, live, route_ids):
+    """Preview a scoped repair without writing either database.
+
+    The backup supplies the planned alias and destination for every selected
+    ``route_id``; backup subscriptions never participate.  A planned alias
+    that is currently owned by a route outside the selected scope rejects the
+    whole preview.  The returned plan is an immutable, in-process object and
+    is only valid against this exact live file.
+    """
+    ids = _validate_route_ids(route_ids)
+    backup_path = Path(backup).resolve()
+    live_path = Path(live).resolve()
+    id_set = set(ids)
+    query = (
+        "SELECT route_id, alias, destination FROM routes "
+        "WHERE route_id IN (%s)" % _placeholders(len(ids))
+    )
+
+    with closing(_read_only(backup_path)) as bk, closing(_read_only(live_path)) as lv:
+        # One read transaction per file keeps each preview internally
+        # consistent even if another connection commits midway.
+        bk.execute("BEGIN")
+        lv.execute("BEGIN")
+        try:
+            backup_rows = bk.execute(query, ids).fetchall()
+            live_rows = lv.execute(query, ids).fetchall()
+            if len(backup_rows) != len(ids) or len(live_rows) != len(ids):
+                raise RouteRepairError(
+                    "missing_route", "every selected id must exist in both databases"
+                )
+            backup_routes = {row[0]: (row[1], row[2]) for row in backup_rows}
+            live_routes = {row[0]: (row[1], row[2]) for row in live_rows}
+
+            planned_aliases = {backup_routes[rid][0] for rid in ids}
+            occupancy_rows = lv.execute(
+                "SELECT alias, route_id FROM routes WHERE alias IN (%s)"
+                % _placeholders(len(planned_aliases)),
+                tuple(planned_aliases),
+            ).fetchall()
+        finally:
+            bk.execute("ROLLBACK")
+            lv.execute("ROLLBACK")
+
+    occupancy = {alias: None for alias in planned_aliases}
+    for alias, owner in occupancy_rows:
+        occupancy[alias] = owner
+    for alias, owner in occupancy.items():
+        if owner is not None and owner not in id_set:
+            raise RouteRepairError(
+                "alias_conflict",
+                "planned alias %r is held by out-of-scope route %d" % (alias, owner),
+            )
+
+    changes = tuple(
+        (
+            rid,
+            live_routes[rid][0],
+            live_routes[rid][1],
+            backup_routes[rid][0],
+            backup_routes[rid][1],
+        )
+        for rid in ids
+    )
+    return RouteRepairPlan(
+        live_path=str(live_path),
+        changes=changes,
+        alias_occupancy=tuple(sorted(occupancy.items())),
+    )
+
+
+def _rewrite_scoped_routes(con, planned):
+    """Move scoped routes to their planned aliases without ever violating
+    the unique alias constraint.
+
+    Subscriptions follow automatically through the foreign key's
+    ``ON UPDATE CASCADE``; this function never touches that table.  Alias
+    cycles are broken by parking one route under a unique temporary alias,
+    which frees its old alias so dependent routes can proceed.
+    """
+    ids = tuple(sorted(planned))
+    planned_aliases = {values[0] for values in planned.values()}
+    remaining = set(ids)
+
+    while remaining:
+        owners = dict(
+            con.execute(
+                "SELECT alias, route_id FROM routes WHERE route_id IN (%s)"
+                % _placeholders(len(ids)),
+                ids,
+            ).fetchall()
+        )
+        for rid in ids:
+            if rid not in remaining:
+                continue
+            target_alias = planned[rid][0]
+            holder = owners.get(target_alias)
+            if holder is None or holder == rid:
+                con.execute(
+                    "UPDATE routes SET alias = ?, destination = ? WHERE route_id = ?",
+                    (target_alias, planned[rid][1], rid),
+                )
+                remaining.remove(rid)
+                break
+        else:
+            # Every remaining route waits on another remaining one: a cycle.
+            # Park the lowest-id route under an alias nobody else can want.
+            rid = min(remaining)
+            forbidden = {row[0] for row in con.execute("SELECT alias FROM routes")}
+            forbidden.update(planned_aliases)
+            base = _REPAIR_TEMP_PREFIX + str(rid)
+            temp_alias, counter = base, 0
+            while temp_alias in forbidden:
+                counter += 1
+                temp_alias = "%s-%d" % (base, counter)
+            con.execute(
+                "UPDATE routes SET alias = ? WHERE route_id = ?", (temp_alias, rid)
+            )
+
+
+def apply_route_repair(live, plan, *, verify):
+    """Apply a previewed plan inside one live write transaction.
+
+    Every selected route and every planned alias occupancy is rechecked
+    before any modification, so concurrent subscription inserts and changes
+    to unrelated routes are tolerated while any observed drift rejects the
+    whole attempt with ``stale_plan``.  ``verify`` runs once against the
+    final, not-yet-committed state; only an explicit ``True`` commits.
+    """
+    if not isinstance(plan, RouteRepairPlan):
+        raise ValueError("plan must be a RouteRepairPlan returned by plan_route_repair")
+    live_path = Path(live).resolve()
+    if live_path != Path(plan.live_path):
+        raise RouteRepairError(
+            "stale_plan", "plan was previewed against a different live database"
+        )
+
+    ids = [change[0] for change in plan.changes]
+    expected_current = {
+        rid: (current_alias, current_destination)
+        for rid, current_alias, current_destination, _planned_alias, _planned_dest
+        in plan.changes
+    }
+    planned = {
+        rid: (planned_alias, planned_destination)
+        for rid, _current_alias, _current_destination, planned_alias, planned_destination
+        in plan.changes
+    }
+    preview_occupancy = dict(plan.alias_occupancy)
+
+    con = sqlite3.connect(live_path, timeout=5)
+    try:
+        # Required so ON UPDATE CASCADE keeps subscriptions.alias in lockstep
+        # while routes are renamed; must be set outside a transaction.
+        con.execute("PRAGMA foreign_keys=ON")
+        con.isolation_level = None
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            current_rows = con.execute(
+                "SELECT route_id, alias, destination FROM routes "
+                "WHERE route_id IN (%s)" % _placeholders(len(ids)),
+                ids,
+            ).fetchall()
+            if len(current_rows) != len(ids):
+                raise RouteRepairError(
+                    "stale_plan", "a selected route is missing from the live database"
+                )
+            for rid, alias, destination in current_rows:
+                if (alias, destination) != expected_current[rid]:
+                    raise RouteRepairError(
+                        "stale_plan", "route %d changed after the preview" % rid
+                    )
+
+            occupancy_rows = con.execute(
+                "SELECT alias, route_id FROM routes WHERE alias IN (%s)"
+                % _placeholders(len(preview_occupancy)),
+                tuple(preview_occupancy),
+            ).fetchall()
+            current_occupancy = {alias: None for alias in preview_occupancy}
+            for alias, owner in occupancy_rows:
+                current_occupancy[alias] = owner
+            for alias, preview_owner in preview_occupancy.items():
+                if current_occupancy[alias] != preview_owner:
+                    raise RouteRepairError(
+                        "stale_plan",
+                        "alias %r changed owner after the preview" % alias,
+                    )
+
+            _rewrite_scoped_routes(con, planned)
+
+            if verify(con) is not True:
+                raise InvalidSnapshot("route repair verification refused the snapshot")
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    finally:
+        con.close()
+    return None

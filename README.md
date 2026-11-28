@@ -82,6 +82,9 @@ python3 -m unittest -v
 python3 demo.py
 ```
 
+`relay_drain.py` 只依赖标准库，仅处理可信本地文件，公开调用按串行约定使用；
+不提供并行压力测试，也不模拟中继故障。新增用例在 `test_relay_drain.py`。
+
 `test_versioned_archive.py` 用真实 SQLite 文件复现离线验收：A→B、B→C 各改一页
 时在 `2S+2P` 预算内上线 C、删除源文件后三个版本仍可独立恢复；候选被业务拒绝
 后活动版与许可保持不变、失败恢复可用同一许可重试；A 的未消费许可使第三版
@@ -184,3 +187,97 @@ else:
 拒绝，不产生任何输出、也不调用业务校验；此时不能再靠这套介质兑现灾备，应从另一
 份独立备份重来，而不是尝试拼凑或修补损坏数据。格式无效的描述符和非法参数抛
 `ValueError`，其他 I/O 错误原样传播。
+
+## 中继下线前的本地疏散规划与接驳控制
+
+`relay_drain` 在现有活库上增加一套**离线规划 + 实际接驳**接口，不发送任何网络
+流量；对端是否就绪由运维调用方在 `finish_handoff` 里回报。数据面以
+`drain_status()` 返回的**实际服务地址**决定向哪台中继发送，配置文件里的主路由
+或规划结果都不代表已经生效的接驳。路由表、订阅表及其外键沿用不动；维护状态存在
+同库的 `relay_drain_*` 私有表中，重开 Python 连接后仍可查询和继续操作。
+
+- `configure_drain(live, capacities=..., retiring=..., fallbacks=..., serving=...)`
+  在未配置的库建立唯一维护任务，成功返回 `None`。`capacities` 是**物理地址**到
+  整数容量的映射（多路由指向同一 `destination` 共用一份容量）；`retiring` 是待
+  下线地址；`fallbacks` 和 `serving` 必须覆盖每条订阅，前者是稳定的备用 `route_id`
+  序列，后者是当前真实服务地址。初始服务地址必须落在该订阅主/备路由可达范围内且
+  不超容量。重复建立报 `already_configured`，不重置既有状态。
+- `drain_status(live)` 返回 `(serving, pending)`：前者是订阅 ID 到数据面**当前**
+  应使用地址的字典；后者是 `(subscription_id, destination)` 或 `None`。全库最多
+  一项待确认接驳，此时新旧两地址各占一个位置，但数据面只向原地址发送。
+- `plan_drain(live)` 从已提交状态给出**一整条**可依次执行的
+  `(subscription_id, destination)` 元组序列，每步假设配置不再变、对端就绪，并在
+  下一步开始时按容量重算（目标必须先有空位，不能先释放自己再换）。它会为受阻的
+  订阅搬移**不在下线中继上**的占位订阅。已疏散完成返回 `()`，确实无法疏散返回
+  `None`；只读、不预留，存在待确认项报 `handoff_pending`。
+- `begin_handoff(live, subscription_id, destination)` 按**当前实况**校验并预留目标
+  位置，不改实际服务地址。目标是当前服务地址、待下线地址或不在当前允许范围报
+  `not_eligible`；符合资格但没有物理空位报 `no_capacity`；已有待确认项报
+  `handoff_pending`。可以执行计划中的一步，也可以执行任何合法一步。
+- `finish_handoff(live, subscription_id, ready=...)` 只处理该订阅的待确认项。没有
+  对应项报 `no_pending`；`ready=False` 释放预留、保留原地址；`ready=True` 时**重新
+  读取当前允许范围**：预留目标已不符合资格则以 `target_changed` 拒绝切换并释放
+  预留，原地址继续服务；仍符合资格才切换实际地址、清空待确认项并释放原位置，作为
+  一次对外不可分割的提交。
+
+业务错误统一用 `DrainError(ValueError)` 的 `reason` 表达（未配置报
+`not_configured`）；非法参数（不存在的 ID、未登记地址、非布尔的 `ready`）抛普通
+`ValueError`；底层 SQLite 错误原样传播。除 `target_changed` 明确要求释放预留外，
+失败不留下部分变化。
+
+```python
+from relay_drain import (
+    DrainError,
+    begin_handoff,
+    configure_drain,
+    drain_status,
+    finish_handoff,
+    plan_drain,
+)
+
+# 1) 建立维护任务（一次）
+configure_drain(
+    "live.db",
+    capacities={"A": 1, "B": 1, "C": 1, "D": 1},
+    retiring="A",
+    fallbacks={101: [20], 202: [30], 303: [40]},
+    serving={101: "A", 202: "B", 303: "C"},
+)
+
+# 2) 试算：只读，不改变现况
+plan = plan_drain("live.db")
+if plan is None:
+    ...  # 确实无法疏散：需要人工处理
+else:
+    for subscription_id, destination in plan:
+        # 3) 预留并等待运维确认对端就绪
+        begin_handoff("live.db", subscription_id, destination)
+        serving, pending = drain_status("live.db")
+        assert serving[subscription_id] != destination  # 仍走原地址
+        try:
+            finish_handoff("live.db", subscription_id, ready=True)
+        except DrainError as exc:
+            if exc.reason == "target_changed":
+                # 预留目标在确认前失去资格：预留已释放、原地址继续服务。
+                # 不要复用旧计划，重新 plan_drain 再执行。
+                plan = plan_drain("live.db")
+                break
+            raise
+```
+
+**遇到未就绪或配置改变时**：`finish_handoff(..., ready=False)` 会保留原服务地址
+并释放预留，同一步可以直接重试 `begin_handoff`；若现有路由修复改动了备用路由的
+目标，旧计划与旧预留都不再具有授权，必须以 `target_changed` 处理后重新
+`plan_drain`。规划不预留位置，并发/串行调用之间配置若变化，每一步的
+`begin_handoff` 都会按当时的真实范围与容量重新判定。
+
+`test_relay_drain.py` 用真实 SQLite 复现两组验收：四台单容量中继 A/B/C/D、
+101/202/303 分别在 A/B/C，主路由 10/20/30、备用 20/30/40，停 A——直接搬
+101→B 报 `no_capacity`，规划的唯一次序是 303→D、202→C、101→B，逐步预留时第二
+连接仍读到原地址且不能并行开始另一项，就绪后读到新址，结束时计划为空，独立 SQL
+证明主路由绑定未变；第二步先报未就绪再同一步重试，随后用既有
+`plan_route_repair`/`apply_route_repair` 把路由 40 的目标从 D 改到 B，相同就绪
+回报以 `target_changed` 拒绝、303 仍在 C，此时重新规划返回 `None`（D 空着但没人
+可达，B/C 也不能互换），直接搬 303→D 报 `not_eligible`；再用旧修复入口改回 D
+后重走三步完成下线。两组容量、订阅与初始接驳完全一致。
+

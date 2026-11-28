@@ -94,5 +94,93 @@ python3 demo.py
 拒绝且不触发校验；校验回调在最终拟提交状态内确认修复关联、另一连接同时仍读到
 修复前状态，回调抛错后原状态完整保留且同一计划可重试成功。
 
+`test_media_backup.py` 用真实 WAL 活库（另有未提交订阅）复现三卷灾备验收：
+发布后校验只看到已提交路由与订阅、候选只读，并独立量出 S 与三卷大小核对上限；
+校验拒绝与回调异常都不留卷。随后在等长单字节损坏、截断、跨槽位搬运和外来备份卷
+下核对巡检只报坏槽，恢复仍呈现原状态；拒绝一次恢复后同一目标重试成功；补卷返回
+槽位号、原坏卷与健康卷字节不变、换入后原描述符巡检全健康、再拿走另一健康卷仍能
+读出原路由与订阅；子进程把单文件上限设成 `ceil(3S/4)` 证明补卷不写整库。最后
+逐一移走每个槽位验证并非只保护固定槽位，并在双坏卷下确认巡检报告全部坏槽、
+恢复与补卷均报 `insufficient_volumes`、不留产物、不执行校验。发布源删除后，另起
+`python -I` 进程仅凭重新打开的描述符与卷路径完成恢复。
+
 样例输出 `newer recovery target refused; no output: True` 与
 `recovered committed rows: [(1,)]`：复制时写端尚未提交的第二条记录未进入副本。
+
+## 三卷离线灾备与单卷自修复
+
+`publish_media(live, volumes, verify=...)` 从活库捕获**一份**已提交 SQLite 状态
+（支持 WAL；其他连接未提交的行不会被纳入），在三份独立介质上按 2-of-3 纠删布局
+分卷：每 64 字节条带拆成前后两半，槽位 0/1 各存一半，槽位 2 存两者异或。任意
+**两卷**即可逐条带重建原始数据库字节，第三卷也可由另两卷逐条带重建，因此不需要
+在内存或磁盘上先拼一份整库。返回的 `bytes` 描述符只含识别、布局与摘要，可独立
+保管，不含任何业务行。每卷文件长度都有硬上限 `ceil(3S/4)`（S 是捕获到的独立
+SQLite 文件字节数，支持 128 KiB–8 MiB）。
+
+三个函数分工明确，**灾备恢复**与**介质补卷**是两项操作：
+
+- `recover_media(descriptor, volumes, target, verify=...)` 用当前可用的两卷生成
+  一份独立、可查询的 SQLite 文件。缺一卷仍成功；坏卷数据绝不混入；先过 SQLite
+  结构检查，`verify` 只拿到该候选的只读连接。已有目标、校验拒绝、回调异常都
+  不会留下目标文件。
+- `repair_media(descriptor, volumes, replacement)` 只补**一个坏槽位**：无坏卷返回
+  `None` 且不建文件；恰有一卷不可用时在 `replacement`（必须尚不存在）写出该槽位
+  的可替换卷并返回槽位号。原三个路径只读不改，也不需要先做一次整库恢复。
+- `inspect_media(descriptor, volumes)` 只读巡检，按槽位返回不可用元组；`None`
+  表示该卷已遗失。截断、等长改写、跨槽位搬运、来自别的备份的卷都会被判为不可用
+  （校验长度、槽位头与整卷摘要，不只看文件头或长度）。
+
+`volumes` 的三项按槽位 0、1、2 排列；卷路径可在移交时改变。补卷过程中只写
+`replacement` 或同父目录的单个发布暂存，不会生成整库中转。
+
+### 小型本地示例
+
+```python
+from pathlib import Path
+from recovery import (
+    MediaBackupError,
+    inspect_media,
+    publish_media,
+    recover_media,
+    repair_media,
+)
+
+vols = [Path("/media/vol0.bin"), Path("/media/vol1.bin"), Path("/media/vol2.bin")]
+
+# 1) 发布：从活库捕获已提交状态，分别写到三份介质
+descriptor = publish_media(
+    "live.db",
+    vols,
+    verify=lambda con: con.execute("PRAGMA foreign_key_check").fetchall() == [],
+)
+Path("descriptor.bin").write_bytes(descriptor)  # 单独保管，可与卷分处异地
+
+# 2) 恢复：任意两卷可用即可（遗失卷用 None 表示）
+print(inspect_media(descriptor, [vols[0], None, vols[2]]))  # (1,)
+recover_media(
+    descriptor,
+    [vols[0], None, vols[2]],
+    "recovered.db",
+    verify=lambda con: con.execute("SELECT count(*) FROM routes").fetchone()[0] > 0,
+)
+
+# 3) 补卷：用原描述符，把坏卷替换成新文件；无需改动描述符
+try:
+    slot = repair_media(descriptor, [vols[0], vols[1], vols[2]], "vol1-new.bin")
+except MediaBackupError as exc:
+    print(exc.reason)
+else:
+    if slot is not None:  # 补成功：把 vol1-new.bin 换入该槽位
+        vols[slot] = Path("vol1-new.bin")
+    print(inspect_media(descriptor, vols))  # 三槽全部健康时为 ()
+```
+
+坏卷的处置流程：先 `inspect_media` 确认到底坏了哪一槽（只报坏槽，不猜）；只要
+坏槽不超过一个，就用 `repair_media` 写到新路径，再把它物理换入对应槽位；原描述符
+不改，换入后巡检应为 `()`，此时再拿走任一原本健康的卷仍可 `recover_media`。
+
+**何时必须停止恢复**：巡检报告**两个或更多**槽位不可用时，无论 `recover_media`
+还是 `repair_media` 都会以 `MediaBackupError.reason == "insufficient_volumes"`
+拒绝，不产生任何输出、也不调用业务校验；此时不能再靠这套介质兑现灾备，应从另一
+份独立备份重来，而不是尝试拼凑或修补损坏数据。格式无效的描述符和非法参数抛
+`ValueError`，其他 I/O 错误原样传播。

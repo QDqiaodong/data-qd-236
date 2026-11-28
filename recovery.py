@@ -14,6 +14,17 @@ one-page edits fits in a budget of "two complete databases plus two pages"
 while older permits keep resolving to their original version.  Every file the
 archive writes for a caller is an independent SQLite database.
 
+``publish_media`` / ``inspect_media`` / ``recover_media`` / ``repair_media``
+are the offline disaster-recovery layer.  One captured SQLite state is split
+across three independently removable volumes using a two-of-three erasure
+layout: each 64-byte stripe of the database is split into halves ``a``/``b``
+stored verbatim on volumes 0 and 1, while volume 2 holds ``a ^ b`` together
+with a per-stripe digest.  Any two volumes therefore reconstruct the exact
+database bytes, and the third can be rebuilt from the other two without ever
+materializing a whole database in memory or on disk.  A small self-contained
+``bytes`` descriptor names the three volume roles, the stripe layout and a
+digest of the database; it carries no user rows.
+
 Only the Python standard library is used.  The implementation is
 single-process, relies on trusted local directories and performs no locking
 against other processes; it makes no power-loss guarantees.
@@ -22,9 +33,11 @@ against other processes; it makes no power-loss guarantees.
 from collections import namedtuple
 from contextlib import closing
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
+import struct
 from tempfile import TemporaryDirectory, mkstemp
 from time import monotonic
 
@@ -122,6 +135,585 @@ def snapshot(live, target, *, verify):
 def recover(archive, target, *, verify):
     """Validate a fresh private copy of the archive before making it visible."""
     return _checked_copy(archive, target, verify)
+
+
+# --------------------------------------------------------------------------
+# Three-volume offline media backup
+# --------------------------------------------------------------------------
+#
+# The captured database is cut into fixed 64-byte stripes.  Stripe ``i`` is
+# split into ``a`` (the first ceil(L/2) bytes) and ``b`` (the rest).  Volume 0
+# stores ``a`` padded to the stripe's record width, volume 1 stores ``b``
+# padded to that same width, and volume 2 stores ``a xor b``.  The three
+# records of every stripe XOR to zero, so any two volumes reconstruct the
+# exact database bytes and the third volume can be rebuilt one stripe at a
+# time.  Nothing ever holds more than a single stripe of database data in
+# memory, and rebuilding a volume never writes a whole-database file.
+
+_MEDIA_SLOTS = 3
+_MEDIA_STRIPE = 64
+_MEDIA_MAGIC = b"QDMEDIA1"
+_MEDIA_HEADER = struct.Struct(">8sBBHQ32s")  # magic, version, slot, stripe, size, digest
+_MEDIA_DESCRIPTOR_MAX = 4096
+_MEDIA_MIN_DB = 128 * 1024
+_MEDIA_MAX_DB = 8 * 1024 * 1024
+_MEDIA_VERSION = 1
+_MEDIA_TEMP_PREFIX = ".media-publish-"
+_MEDIA_WORK_PREFIX = ".media-work-"
+_MEDIA_RECOVER_PREFIX = ".media-recover-"
+
+
+class MediaBackupError(RuntimeError):
+    """The three-volume backup cannot be completed from the volumes at hand.
+
+    ``reason`` is ``"insufficient_volumes"`` when two or more slots are
+    unusable.  Neither a recovery nor a single-slot repair is possible then,
+    so no product is written and no business verifier is invoked.
+    """
+
+    def __init__(self, reason, detail=""):
+        self.reason = reason
+        message = reason if not detail else "%s: %s" % (reason, detail)
+        super().__init__(message)
+
+
+# -- geometry ---------------------------------------------------------------
+
+
+def _media_stripes(db_size):
+    return (db_size + _MEDIA_STRIPE - 1) // _MEDIA_STRIPE
+
+
+def _media_stripe_length(db_size, index):
+    return min(_MEDIA_STRIPE, db_size - index * _MEDIA_STRIPE)
+
+
+def _media_record_width(db_size, index):
+    return (_media_stripe_length(db_size, index) + 1) // 2
+
+
+def _media_volume_size(db_size):
+    stripes = _media_stripes(db_size)
+    payload = 32 * (stripes - 1) + _media_record_width(db_size, stripes - 1)
+    return _MEDIA_HEADER.size + payload
+
+
+def _media_volume_limit(db_size):
+    """Hard ceiling for every volume: ceil(3S/4)."""
+    return (3 * db_size + 3) // 4
+
+
+def _media_header(slot, db_size, digest):
+    return _MEDIA_HEADER.pack(
+        _MEDIA_MAGIC, _MEDIA_VERSION, slot, _MEDIA_STRIPE, db_size, digest
+    )
+
+
+def _media_validate_size(db_size):
+    if isinstance(db_size, bool) or not isinstance(db_size, int):
+        raise ValueError("database size must be an integer")
+    if not (_MEDIA_MIN_DB <= db_size <= _MEDIA_MAX_DB):
+        raise ValueError(
+            "database size %d is outside the supported 128 KiB to 8 MiB range"
+            % db_size
+        )
+    # Every captured SQLite file is a whole number of pages of at least 512
+    # bytes, so it is a multiple of the stripe size.  Rejecting other sizes
+    # keeps the last stripe full and the layout unambiguous.
+    if db_size % _MEDIA_STRIPE:
+        raise ValueError("database size %d is not stripe-aligned" % db_size)
+    if _media_volume_size(db_size) > _media_volume_limit(db_size):
+        raise ValueError("a volume would exceed the ceil(3S/4) ceiling")
+    return db_size
+
+
+# -- descriptor -------------------------------------------------------------
+
+
+def _media_build_descriptor(db_size, digest, volume_digests):
+    payload = {
+        "v": _MEDIA_VERSION,
+        "db_size": db_size,
+        "stripe": _MEDIA_STRIPE,
+        "slots": _MEDIA_SLOTS,
+        "volume_size": _media_volume_size(db_size),
+        "db_sha256": digest.hex(),
+        "volume_sha256": [item.hex() for item in volume_digests],
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if len(raw) > _MEDIA_DESCRIPTOR_MAX:
+        raise ValueError("descriptor would exceed the 4096 byte limit")
+    return raw
+
+
+def _media_digest_field(value, what):
+    try:
+        digest = bytes.fromhex(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s digest is invalid" % what)
+    if len(digest) != 32:
+        raise ValueError("%s digest is invalid" % what)
+    return digest
+
+
+def _media_parse_descriptor(descriptor):
+    if isinstance(descriptor, (bytearray, memoryview)):
+        descriptor = bytes(descriptor)
+    if not isinstance(descriptor, bytes):
+        raise ValueError("descriptor must be the bytes returned by publish_media")
+    if not descriptor or len(descriptor) > _MEDIA_DESCRIPTOR_MAX:
+        raise ValueError("descriptor length is invalid")
+    try:
+        payload = json.loads(descriptor.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError("descriptor is not valid media metadata")
+    if not isinstance(payload, dict) or payload.get("v") != _MEDIA_VERSION:
+        raise ValueError("unsupported media descriptor")
+    if payload.get("stripe") != _MEDIA_STRIPE or payload.get("slots") != _MEDIA_SLOTS:
+        raise ValueError("descriptor layout is not supported")
+    db_size = payload.get("db_size")
+    if isinstance(db_size, bool) or not isinstance(db_size, int):
+        raise ValueError("descriptor database size is invalid")
+    try:
+        _media_validate_size(db_size)
+    except ValueError:
+        raise ValueError("descriptor database size is invalid")
+    if payload.get("volume_size") != _media_volume_size(db_size):
+        raise ValueError("descriptor volume size disagrees with its layout")
+    digest = _media_digest_field(payload.get("db_sha256"), "database")
+    volumes = payload.get("volume_sha256")
+    if not isinstance(volumes, list) or len(volumes) != _MEDIA_SLOTS:
+        raise ValueError("descriptor volume digests are invalid")
+    volume_digests = tuple(
+        _media_digest_field(value, "volume %d" % slot)
+        for slot, value in enumerate(volumes)
+    )
+    return db_size, digest, volume_digests
+
+
+# -- paths ------------------------------------------------------------------
+
+
+def _media_normalize_volumes(volumes, *, allow_none, must_not_exist):
+    if not isinstance(volumes, (list, tuple)) or len(volumes) != _MEDIA_SLOTS:
+        raise ValueError("volumes must be a sequence of exactly three paths")
+    paths = []
+    for slot, value in enumerate(volumes):
+        if value is None:
+            if not allow_none:
+                raise ValueError("volume %d path must not be None" % slot)
+            paths.append(None)
+            continue
+        if isinstance(value, (bytes, int, bool)):
+            raise ValueError("volume %d path must be a filesystem path" % slot)
+        try:
+            path = Path(value)
+        except TypeError:
+            raise ValueError("volume %d path must be a filesystem path" % slot)
+        if must_not_exist and os.path.lexists(path):
+            raise FileExistsError(path)
+        paths.append(path)
+    present = [path for path in paths if path is not None]
+    keys = {(os.path.realpath(path.parent), path.name) for path in present}
+    if len(keys) != len(present):
+        raise ValueError("volume paths must be distinct")
+    return tuple(paths)
+
+
+def _media_target_path(target):
+    if target is None:
+        raise ValueError("target path must not be None")
+    try:
+        path = Path(target)
+    except TypeError:
+        raise ValueError("target path must be a filesystem path")
+    if os.path.lexists(path):
+        raise FileExistsError(path)
+    if not path.parent.is_dir():
+        raise FileNotFoundError(path.parent)
+    return path
+
+
+# -- volume validation ------------------------------------------------------
+
+
+def _media_check_volume(path, slot, db_size, digest, volume_digest):
+    """Whether ``path`` is exactly the volume the descriptor expects.
+
+    The check covers the exact file length, the slot-specific header and a
+    digest of every file byte, so truncation, equal-length rewrites and a
+    volume copied in from another backup are all rejected.  Nothing is
+    written and nothing is cached between calls.
+    """
+    if path is None:
+        return False
+    expected_size = _media_volume_size(db_size)
+    expected_header = _media_header(slot, db_size, digest)
+    try:
+        with open(path, "rb") as handle:
+            if os.fstat(handle.fileno()).st_size != expected_size:
+                return False
+            header = handle.read(len(expected_header))
+            if header != expected_header:
+                return False
+            hasher = hashlib.sha256()
+            hasher.update(header)
+            remaining = expected_size - len(header)
+            while remaining:
+                chunk = handle.read(min(1 << 20, remaining))
+                if not chunk:
+                    return False
+                hasher.update(chunk)
+                remaining -= len(chunk)
+    except OSError:
+        return False
+    return hasher.digest() == volume_digest
+
+
+def _media_scan(db_size, digest, volume_digests, volumes):
+    return [
+        _media_check_volume(path, slot, db_size, digest, volume_digests[slot])
+        for slot, path in enumerate(volumes)
+    ]
+
+
+def _media_bad_slots(healthy):
+    return tuple(slot for slot, ok in enumerate(healthy) if not ok)
+
+
+# -- stripe helpers ---------------------------------------------------------
+
+
+def _media_xor(left, right):
+    """XOR two equal-record-width byte strings."""
+    width = max(len(left), len(right))
+    return (int.from_bytes(left, "big") ^ int.from_bytes(right, "big")).to_bytes(
+        width, "big"
+    )
+
+
+def _media_stripe_parts(raw):
+    width = (len(raw) + 1) // 2
+    first = raw[:width]
+    second = raw[width:]
+    return (
+        first + b"\x00" * (width - len(first)),
+        second + b"\x00" * (width - len(second)),
+    )
+
+
+# -- capture ----------------------------------------------------------------
+
+
+def _media_capture(live, work):
+    """Copy committed state into ``work`` and run SQLite's own integrity check.
+
+    ``live`` is opened read-only, so a second connection's uncommitted rows
+    stay out of the copy while WAL content that *is* committed is included.
+    The private copy is switched to a rollback journal so it is a single
+    standalone file whose byte length is the captured size ``S``.
+    """
+    deadline = monotonic() + 3
+
+    def check_progress(_status, _remaining, _total):
+        if monotonic() > deadline:
+            raise TimeoutError("SQLite copy exceeded its local time budget")
+
+    with closing(_read_only(live)) as source, closing(sqlite3.connect(work)) as copy:
+        source.backup(copy, pages=64, sleep=0.01, progress=check_progress)
+        copy.execute("PRAGMA journal_mode=DELETE").fetchone()
+    with closing(_immutable_read_only(work)) as probe:
+        if probe.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise InvalidSnapshot("SQLite integrity check failed")
+
+
+def _media_source_size(live):
+    live = Path(live)
+    if not live.is_file():
+        raise ValueError("live database must be an existing file")
+    with closing(_read_only(live)) as probe:
+        page_size = probe.execute("PRAGMA page_size").fetchone()[0]
+        page_count = probe.execute("PRAGMA page_count").fetchone()[0]
+    return _media_validate_size(int(page_size) * int(page_count))
+
+
+# --------------------------------------------------------------------------
+# Public media API
+# --------------------------------------------------------------------------
+
+
+def publish_media(live, volumes, *, verify):
+    """Split one committed SQLite state across three removable volumes.
+
+    The live database is copied read-only (WAL included, uncommitted rows
+    excluded) into one private working database, which is structurally
+    checked and then handed to ``verify`` as a read-only connection.  Only an
+    explicit ``True`` publishes.  Volumes are written to per-slot temporary
+    files and hard-linked into place, so no existing target is ever
+    overwritten and a failure leaves neither volumes nor a descriptor.
+    """
+    paths = _media_normalize_volumes(volumes, allow_none=False, must_not_exist=True)
+    for path in paths:
+        if not path.parent.is_dir():
+            raise FileNotFoundError(path.parent)
+    _media_source_size(live)
+
+    handles = []
+    temporaries = []
+    published = []
+    try:
+        with TemporaryDirectory(prefix=_MEDIA_WORK_PREFIX, dir=paths[0].parent) as work_dir:
+            work = Path(work_dir) / "capture.sqlite"
+            _media_capture(live, work)
+            db_size = os.path.getsize(work)
+            _media_validate_size(db_size)
+            with closing(_immutable_read_only(work)) as candidate:
+                if verify(candidate) is not True:
+                    raise InvalidSnapshot("application check refused snapshot")
+
+            digest = _hash_file(work)
+            expected_size = _media_volume_size(db_size)
+            if expected_size > _media_volume_limit(db_size):
+                raise ValueError("a volume would exceed the ceil(3S/4) ceiling")
+            stripes = _media_stripes(db_size)
+
+            hashers = []
+            for slot, path in enumerate(paths):
+                fd, temporary = mkstemp(prefix=_MEDIA_TEMP_PREFIX, dir=path.parent)
+                handle = os.fdopen(fd, "w+b")
+                header = _media_header(slot, db_size, digest)
+                handle.write(header)
+                hasher = hashlib.sha256()
+                hasher.update(header)
+                handles.append(handle)
+                temporaries.append(Path(temporary))
+                hashers.append(hasher)
+
+            with open(work, "rb") as source:
+                for index in range(stripes):
+                    length = _media_stripe_length(db_size, index)
+                    raw = source.read(length)
+                    if len(raw) != length:
+                        raise InvalidSnapshot("captured database changed while publishing")
+                    first, second = _media_stripe_parts(raw)
+                    xor = _media_xor(first, second)
+                    for slot, record in enumerate((first, second, xor)):
+                        handles[slot].write(record)
+                        hashers[slot].update(record)
+
+            for handle, path in zip(handles, paths):
+                handle.flush()
+                os.fsync(handle.fileno())
+                if os.fstat(handle.fileno()).st_size != expected_size:
+                    raise RuntimeError("volume staging size disagrees with its layout")
+
+            descriptor = _media_build_descriptor(
+                db_size, digest, [hasher.digest() for hasher in hashers]
+            )
+
+            try:
+                for temp, path in zip(temporaries, paths):
+                    os.link(temp, path)
+                    published.append(path)
+            except BaseException:
+                for path in published:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+                raise
+            return descriptor
+    finally:
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        for temp in temporaries:
+            try:
+                os.unlink(temp)
+            except FileNotFoundError:
+                pass
+
+
+def inspect_media(descriptor, volumes):
+    """Report unavailable slots, in slot order, using only reads.
+
+    ``volumes`` may contain ``None`` for a volume that is gone.  A slot is
+    usable only when the file's length, slot header and every byte match the
+    independently held descriptor, so a truncated, rewritten, swapped or
+    foreign volume is reported as unavailable.  Paths may be moved between
+    calls; nothing is written.
+    """
+    db_size, digest, volume_digests = _media_parse_descriptor(descriptor)
+    paths = _media_normalize_volumes(volumes, allow_none=True, must_not_exist=False)
+    healthy = _media_scan(db_size, digest, volume_digests, paths)
+    return _media_bad_slots(healthy)
+
+
+def _media_open_reader(path, db_size):
+    handle = open(path, "rb")
+    handle.seek(_MEDIA_HEADER.size)
+    return handle
+
+
+def _media_decode_stripe(slot_a, slot_b, record_a, record_b, db_size, index):
+    """Reconstruct the original stripe bytes from any two volume records."""
+    length = _media_stripe_length(db_size, index)
+    width = (length + 1) // 2
+    if (slot_a, slot_b) == (0, 1):
+        first, second = record_a, record_b
+    elif (slot_a, slot_b) == (0, 2):
+        first, second = record_a, _media_xor(record_a, record_b)
+    else:  # (1, 2)
+        first, second = _media_xor(record_a, record_b), record_a
+    return first[:width] + second[: length - width]
+
+
+def _media_choose_pair(healthy):
+    present = [slot for slot, ok in enumerate(healthy) if ok]
+    return present[0], present[1]
+
+
+def recover_media(descriptor, volumes, target, *, verify):
+    """Build an independent SQLite file from any two usable volumes.
+
+    Missing or damaged volumes are never mixed into the result: the two
+    usable slots are selected from the descriptor's byte-level checks, the
+    database is streamed out stripe by stripe, and the finished candidate is
+    structurally checked and offered to ``verify`` on a read-only connection
+    before being hard-linked into place.  Two or more unusable slots raise
+    :class:`MediaBackupError` with ``reason == "insufficient_volumes"`` before
+    anything is written or verified.
+    """
+    db_size, digest, volume_digests = _media_parse_descriptor(descriptor)
+    paths = _media_normalize_volumes(volumes, allow_none=True, must_not_exist=False)
+    healthy = _media_scan(db_size, digest, volume_digests, paths)
+    bad = _media_bad_slots(healthy)
+    if len(bad) >= 2:
+        # Refuse before touching the target or invoking the verifier.
+        raise MediaBackupError(
+            "insufficient_volumes",
+            "%d of %d volumes are unusable; at least two are required"
+            % (len(bad), _MEDIA_SLOTS),
+        )
+    target = _media_target_path(target)
+    slot_a, slot_b = _media_choose_pair(healthy)
+
+    fd, name = mkstemp(prefix=_MEDIA_RECOVER_PREFIX, dir=target.parent)
+    os.close(fd)
+    staging = Path(name)
+    try:
+        hasher = hashlib.sha256()
+        with open(staging, "wb") as out, closing(
+            _media_open_reader(paths[slot_a], db_size)
+        ) as reader_a, closing(_media_open_reader(paths[slot_b], db_size)) as reader_b:
+            stripes = _media_stripes(db_size)
+            for index in range(stripes):
+                width = _media_record_width(db_size, index)
+                record_a = reader_a.read(width)
+                record_b = reader_b.read(width)
+                if len(record_a) != width or len(record_b) != width:
+                    raise InvalidSnapshot("a volume ended in the middle of the database")
+                raw = _media_decode_stripe(
+                    slot_a, slot_b, record_a, record_b, db_size, index
+                )
+                out.write(raw)
+                hasher.update(raw)
+            out.flush()
+            os.fsync(out.fileno())
+        if hasher.digest() != digest:
+            raise InvalidSnapshot("reconstructed bytes failed their integrity check")
+
+        with closing(_immutable_read_only(staging)) as candidate:
+            if candidate.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise InvalidSnapshot("SQLite integrity check failed")
+            if verify(candidate) is not True:
+                raise InvalidSnapshot("application check refused snapshot")
+        os.link(staging, target)
+        return target
+    finally:
+        try:
+            os.unlink(staging)
+        except FileNotFoundError:
+            pass
+
+
+def repair_media(descriptor, volumes, replacement):
+    """Rebuild exactly one unusable slot into a new volume file.
+
+    With no unusable slot nothing is written and ``None`` is returned.  With
+    exactly one unusable slot the missing volume is reconstructed from the
+    other two one stripe at a time, written to a same-directory staging file,
+    checked against the descriptor's digest and hard-linked to
+    ``replacement``; the slot number is returned.  The three original paths
+    are only read.  With two or more unusable slots
+    :class:`MediaBackupError` with ``reason == "insufficient_volumes"`` is
+    raised before any file is created.
+    """
+    db_size, digest, volume_digests = _media_parse_descriptor(descriptor)
+    paths = _media_normalize_volumes(volumes, allow_none=True, must_not_exist=False)
+    healthy = _media_scan(db_size, digest, volume_digests, paths)
+    bad = _media_bad_slots(healthy)
+    if not bad:
+        return None
+    if len(bad) >= 2:
+        raise MediaBackupError(
+            "insufficient_volumes",
+            "%d of %d volumes are unusable; at most one can be repaired"
+            % (len(bad), _MEDIA_SLOTS),
+        )
+    if replacement is None:
+        raise ValueError("replacement path must not be None")
+    try:
+        replacement = Path(replacement)
+    except TypeError:
+        raise ValueError("replacement path must be a filesystem path")
+    target_slot = bad[0]
+    if os.path.lexists(replacement):
+        raise FileExistsError(replacement)
+    if not replacement.parent.is_dir():
+        raise FileNotFoundError(replacement.parent)
+    # Any file at one of the three original paths is never overwritten: the
+    # ``os.path.lexists`` check above already raised for those.  A slot whose
+    # file is gone has no existing volume, so its path is a legal
+    # not-yet-existing replacement target.
+
+    source_slots = [slot for slot in range(_MEDIA_SLOTS) if slot != target_slot]
+    slot_a, slot_b = source_slots
+
+    fd, name = mkstemp(prefix=_MEDIA_TEMP_PREFIX, dir=replacement.parent)
+    os.close(fd)
+    staging = Path(name)
+    try:
+        hasher = hashlib.sha256()
+        with open(staging, "wb") as out, closing(
+            _media_open_reader(paths[slot_a], db_size)
+        ) as reader_a, closing(_media_open_reader(paths[slot_b], db_size)) as reader_b:
+            header = _media_header(target_slot, db_size, digest)
+            out.write(header)
+            hasher.update(header)
+            stripes = _media_stripes(db_size)
+            for index in range(stripes):
+                width = _media_record_width(db_size, index)
+                record_a = reader_a.read(width)
+                record_b = reader_b.read(width)
+                if len(record_a) != width or len(record_b) != width:
+                    raise InvalidSnapshot("a source volume ended unexpectedly")
+                record = _media_xor(record_a, record_b)
+                out.write(record)
+                hasher.update(record)
+            out.flush()
+            os.fsync(out.fileno())
+        if hasher.digest() != volume_digests[target_slot]:
+            raise InvalidSnapshot("rebuilt volume failed its integrity check")
+        os.link(staging, replacement)
+        return target_slot
+    finally:
+        try:
+            os.unlink(staging)
+        except FileNotFoundError:
+            pass
 
 
 # --------------------------------------------------------------------------
